@@ -64,9 +64,9 @@ static size_t detect(const char *cwd, char *dev, char *fstype, char *opts)
             continue;
         if (len >= best) {
             best = len;
-            strcpy(dev, ld);
-            strcpy(fstype, lf);
-            strcpy(opts, lo);
+            snprintf(dev, 4096, "%s", ld);
+            snprintf(fstype, 64, "%s", lf);
+            snprintf(opts, 4096, "%s", lo);
         }
     }
     fclose(m);
