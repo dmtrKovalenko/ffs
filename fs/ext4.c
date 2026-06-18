@@ -46,50 +46,65 @@ static int read_inode(efs *e, ino_id ino, uint8_t inode[256])
                : -1;
 }
 
-// Copy every extent of a tree node into buf (file-block-addressed).
+// Streaming state for extent walks: sink + bookkeeping to reconstruct the file
+// in ascending file-offset order. cap is logical size; next is the first byte
+// not yet streamed (gaps before an extent are holes -> zeros).
+struct estream {
+    efs *e;
+    fs_sink sink;
+    void *arg;
+    uint64_t cap, next;
+    int rc;
+};
+
+// Walk the extent tree, streaming each extent (and any preceding hole) in order.
 // node: 12-byte header + 12-byte entries; the root lives in i_block[60].
-static int extents(efs *e, const uint8_t *node, uint32_t node_size, uint8_t *buf,
-                   uint64_t cap)
+static int extents(struct estream *s, const uint8_t *node, uint32_t node_size)
 {
-    if (le16(node) != EXT_MAGIC) {
+    efs *e = s->e;
+    if (le16(node) != EXT_MAGIC)
         return -1;
-    }
 
     uint32_t n = le16(node + 2), depth = le16(node + 6);
-    if (12 + n * 12 > node_size) {
+    if (12 + n * 12 > node_size)
         return -1;
-    }
 
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *x = node + 12 + i * 12;
         if (depth > 0) {
             uint8_t blk[e->bs];
             uint64_t child = le32(x + 4) | (uint64_t)le16(x + 8) << 32;
-            if (pread(e->fd, blk, e->bs, (off_t)(child * e->bs)) != (ssize_t)e->bs ||
-                extents(e, blk, e->bs, buf, cap))
+            if (pread(e->fd, blk, e->bs, (off_t)(child * e->bs)) != (ssize_t)e->bs)
                 return -1;
+            int r = extents(s, blk, e->bs);
+            if (r)
+                return r;
             continue;
         }
         uint32_t len = le16(x + 4);
-        if (len > 32768) // when unwritten leave zeros
+        if (len > 32768) // unwritten -> leave as zeros (filled by gap/tail)
             continue;
         uint64_t dst = (uint64_t)le32(x) * e->bs;
         uint64_t phys = (le32(x + 8) | (uint64_t)le16(x + 6) << 32) * e->bs;
-        if (dst >= cap)
+        if (dst >= s->cap)
             continue;
 
         uint64_t nb = (uint64_t)len * e->bs;
-        if (nb > cap - dst)
-            nb = cap - dst;
+        if (nb > s->cap - dst)
+            nb = s->cap - dst;
 
-        if (pread(e->fd, buf + dst, nb, (off_t)phys) != (ssize_t)nb)
-            return -1;
+        if (dst > s->next && (s->rc = sink_zeros(s->sink, s->arg, dst - s->next)))
+            return s->rc;
+        int r = sink_pread(e->fd, phys, nb, s->sink, s->arg);
+        if (r)
+            return s->rc = r; // -1 on I/O, sink-rc on early-stop
+        s->next = dst + nb;
     }
     return 0;
 }
 
-// Whole inode content (file or directory), malloc'd and block-padded.
-static long read_content(efs *e, ino_id ino, uint8_t **out)
+// Stream an inode's content (file or directory) to sink in file-offset order.
+static long read_content(efs *e, ino_id ino, fs_sink sink, void *arg)
 {
     uint8_t inode[256];
     if (read_inode(e, ino, inode))
@@ -97,13 +112,14 @@ static long read_content(efs *e, ino_id ino, uint8_t **out)
     uint64_t size = le32(inode + 4) | (uint64_t)le32(inode + 108) << 32;
     if (!size || size > FILE_CAP || !(le32(inode + 32) & EXTENTS_FL))
         return -1;
-    uint64_t cap = (size + e->bs - 1) & ~((uint64_t)e->bs - 1);
-    uint8_t *buf = calloc(1, cap);
-    if (!buf || extents(e, inode + 40, 60, buf, cap)) {
-        free(buf);
+    struct estream s = {.e = e, .sink = sink, .arg = arg, .cap = size};
+    int r = extents(&s, inode + 40, 60);
+    if (r < 0)
         return -1;
-    }
-    *out = buf;
+    if (r) // sink asked to stop early
+        return (long)size;
+    if (s.next < size) // trailing hole
+        sink_zeros(sink, arg, size - s.next);
     return (long)size;
 }
 
@@ -137,16 +153,40 @@ static int ext4_open(rawfs *fs, const char *device, const char *mntopts)
     return 0;
 }
 
+// Collector sink: accumulate streamed content into a growable buffer. Used by
+// list_dir, which needs the whole (small) directory in memory to parse it.
+struct collect {
+    uint8_t *buf;
+    size_t len, cap;
+};
+static int collect_sink(const uint8_t *chunk, size_t len, void *arg)
+{
+    struct collect *c = arg;
+    if (c->len + len > c->cap) {
+        c->cap = (c->len + len) * 2;
+        c->buf = realloc(c->buf, c->cap);
+        if (!c->buf)
+            return -1;
+    }
+    memcpy(c->buf + c->len, chunk, len);
+    c->len += len;
+    return 0;
+}
+
 static int ext4_list_dir(rawfs *fs, ino_id dir, int (*cb)(const rg_dirent *, void *),
                       void *arg)
 {
     efs *e = fs->ctx;
-    uint8_t *buf;
-    long n = read_content(e, dir, &buf);
-    if (n < 0)
+    struct collect c = {0};
+    long n = read_content(e, dir, collect_sink, &c);
+    if (n < 0 || !c.buf) {
+        free(c.buf);
         return -1;
+    }
+    uint8_t *buf = c.buf;
+    n = (long)c.len;
 
-    // classic dirent chain: inode(4) rec_len(2) name_len(1) type(1) name.
+    // inode(4) rec_len(2) name_len(1) type(1) name.
     // htree interior nodes hide inside empty (inode=0) entries, so a linear
     // rec_len scan works for hashed directories too.
     int r = 0;
@@ -168,9 +208,9 @@ static int ext4_list_dir(rawfs *fs, ino_id dir, int (*cb)(const rg_dirent *, voi
     return r < 0 ? r : 0;
 }
 
-static long ext4_read_file(rawfs *fs, ino_id ino, uint8_t **out)
+static long ext4_read_file(rawfs *fs, ino_id ino, fs_sink sink, void *arg)
 {
-    return read_content(fs->ctx, ino, out);
+    return read_content(fs->ctx, ino, sink, arg);
 }
 
 static void ext4_close(rawfs *fs)

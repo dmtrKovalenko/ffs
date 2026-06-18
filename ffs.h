@@ -40,21 +40,28 @@ typedef struct {
     uint8_t is_dir;
 } rg_dirent;
 
+typedef int (*fs_sink)(const uint8_t *chunk, size_t len, void *arg);
+
 // Raw filesystem interface: each fs/<name>.c implements these four calls.
 typedef struct rawfs rawfs;
+
 struct rawfs {
     void *ctx;
     ino_id root; // inode of the filesystem (or subvolume) root dir
     int (*open)(rawfs *fs, const char *device, const char *mntopts);
     int (*list_dir)(rawfs *fs, ino_id dir, int (*cb)(const rg_dirent *, void *),
                     void *arg);
-    long (*read_file)(rawfs *fs, ino_id file, uint8_t **out); // malloc'd, -1 = skip
+    long (*read_file)(rawfs *fs, ino_id file, fs_sink sink, void *arg);
     void (*close)(rawfs *fs);
 };
 
 int btrfs_init(rawfs *fs);
 int ext4_init(rawfs *fs);
 int apfs_init(rawfs *fs);
+
+// Streaming helpers shared by fs/*.c readers (utils.c).
+int sink_zeros(fs_sink sink, void *arg, uint64_t len);
+int sink_pread(int fd, uint64_t off, uint64_t len, fs_sink sink, void *arg);
 
 int ffs_run(rawfs *fs, const char *rel, const char *pattern);
 

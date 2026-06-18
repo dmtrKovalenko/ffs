@@ -180,20 +180,13 @@ static int fs_walk(afs *a, uint64_t tree, uint64_t oid, uint8_t type, rec_cb cb,
     return 0;
 }
 
-// If the target starts with a GPT (a whole disk or a .dmg image rather than a
-// bare partition/container), locate the Apple_APFS partition and return its
-// byte offset. Returns 0 when there is no GPT, i.e. byte 0 is already the
-// container (a partition node like /dev/rdiskNsM, or a carved .raw).
-//
-// GPT type GUID for an APFS container is 7C3457EF-0000-11AA-AA11-00306543ECAC,
-// stored mixed-endian on disk: first three groups little-endian, last two as
-// stored bytes -> EF 57 34 7C | 00 00 | AA 11 | AA 11 | 00 30 65 43 EC AC.
+// if the target starts with GPT parition (e.g. dmg file) we have to first find the offset
+// to the actual APFS start block which is dynamic - just look for apfs guid
 static uint64_t find_apfs_partition(int fd)
 {
     static const uint8_t APFS_GUID[16] = {0xEF, 0x57, 0x34, 0x7C, 0x00, 0x00, 0xAA, 0x11,
                                           0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC};
-    // The GPT header lives in LBA 1. We probe both common sector sizes since
-    // either is valid (512-byte: header at offset 512; 4096-byte: at 4096).
+    // The GPT header always lives in LBA 1
     const uint64_t sector_sizes[] = {512, 4096};
     for (unsigned s = 0; s < 2; s++) {
         uint64_t sector = sector_sizes[s];
@@ -428,13 +421,15 @@ static int inode_cb(const uint8_t *k, uint32_t kl, const uint8_t *v, uint32_t vl
 
 struct rf {
     afs *a;
-    uint8_t *buf;
-    uint64_t size;
+    fs_sink sink;
+    void *arg;
+    uint64_t size, next;
+    int rc;
     int err;
 };
 
 // FILE_EXTENT key: j_key(8) logical_addr(8). value: len_and_flags(8)
-// phys_block_num(8) crypto_id(8).
+// phys_block_num(8) crypto_id(8). Extents arrive in ascending logical order.
 static int extent_cb(const uint8_t *k, uint32_t kl, const uint8_t *v, uint32_t vl,
                      void *arg)
 {
@@ -448,13 +443,23 @@ static int extent_cb(const uint8_t *k, uint32_t kl, const uint8_t *v, uint32_t v
         return 0;
     if (len > r->size - logical)
         len = r->size - logical;
-    if (pread(r->a->fd, r->buf + logical, len, (off_t)(r->a->base + phys * r->a->bs)) !=
-        (ssize_t)len)
+
+    if (logical > r->next && (r->rc = sink_zeros(r->sink, r->arg, logical - r->next)))
+        return 1;
+    int rr = sink_pread(r->a->fd, r->a->base + phys * r->a->bs, len, r->sink, r->arg);
+    if (rr < 0) {
         r->err = 1;
+        return 1;
+    }
+    if (rr) {
+        r->rc = rr;
+        return 1;
+    }
+    r->next = logical + len;
     return 0;
 }
 
-static long apfs_read_file(rawfs *fs, ino_id ino, uint8_t **out)
+static long apfs_read_file(rawfs *fs, ino_id ino, fs_sink sink, void *arg)
 {
     afs *a = fs->ctx;
     struct inode_info ii = {0, 0, 0};
@@ -462,15 +467,12 @@ static long apfs_read_file(rawfs *fs, ino_id ino, uint8_t **out)
     if (!ii.found || ii.size == 0 || ii.size > FILE_CAP)
         return -1; // empty, huge, or decmpfs
 
-    struct rf r = {a, calloc(1, ii.size), ii.size, 0};
-    if (!r.buf)
-        return -1;
+    struct rf r = {.a = a, .sink = sink, .arg = arg, .size = ii.size};
     fs_walk(a, a->root_tree, ii.priv, TYPE_FILE_EXTENT, extent_cb, &r);
-    if (r.err) {
-        free(r.buf);
+    if (r.err)
         return -1;
-    }
-    *out = r.buf;
+    if (!r.rc && r.next < ii.size) // trailing hole
+        sink_zeros(sink, arg, ii.size - r.next);
     return (long)ii.size;
 }
 

@@ -3,7 +3,7 @@
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 
-SRC = main.c ffs.c fs/btrfs.c fs/ext4.c fs/apfs.c
+SRC = main.c ffs.c utils.c fs/btrfs.c fs/ext4.c fs/apfs.c
 HDR = ffs.h
 BIN = ffs
 

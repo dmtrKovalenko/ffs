@@ -1,7 +1,3 @@
-// ffs.c — filesystem-agnostic engine: resolve the start path to an inode,
-// collect the file tree, grep file contents in parallel, print path:line:text
-// in collection order.
-#define _GNU_SOURCE
 #include "ffs.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -103,52 +99,113 @@ static void collect(rawfs *fs, ino_id dir, char *path, size_t plen, filevec *fv)
     free(ev.v);
 }
 
-// Append formatted output into a per-file growable buffer.
-static void emit(char **buf, size_t *len, size_t *cap, const char *path, size_t line,
-                 const uint8_t *ls, size_t llen)
+enum { PAT_MAX = 256 }; // pattern-length cap (carry is patlen-1, joined 2*PAT_MAX)
+struct grep {
+    const char *path;
+    const uint8_t *pat;
+    size_t patlen;
+    char *out; // formatted matches, or NULL
+    size_t olen, ocap;
+    uint8_t carry[PAT_MAX]; // last patlen-1 bytes of the previous chunk
+    size_t carrylen;
+    long lines;        // newlines fully seen so far (line of next byte = lines+1)
+    long last_emitted; // line# of last emit (0 = none); dedups lines split across chunks
+    int binary;        // NUL seen in first 1KB -> stop
+    long seen;
+};
+
+// Count '\n' in [p, p+n). Linear loop, autovectorized at -O2 (vpcmpeqb + accum).
+static inline long count_nl(const uint8_t *p, size_t n)
 {
-    size_t need = strlen(path) + llen + 32;
-    if (*len + need > *cap) {
-        *cap = (*len + need) * 2;
-        *buf = realloc(*buf, *cap);
-    }
-    *len += (size_t)snprintf(*buf + *len, *cap - *len, "%s:%zu:%.*s\n", path, line,
-                             (int)llen, ls);
+    long c = 0;
+    for (size_t i = 0; i < n; i++)
+        c += (p[i] == '\n');
+    return c;
 }
 
-// Phase 2 worker: read one file, search it, format matches into job->result.
+static void emit_match(struct grep *g, long line, const uint8_t *ls, size_t llen)
+{
+    size_t need = strlen(g->path) + llen + 32;
+    if (g->olen + need > g->ocap) {
+        g->ocap = (g->olen + need) * 2;
+        g->out = realloc(g->out, g->ocap);
+    }
+    g->olen += (size_t)snprintf(g->out + g->olen, g->ocap - g->olen, "%s:%ld:%.*s\n",
+                                g->path, line, (int)llen, ls);
+}
+
+static int grep_sink(const uint8_t *chunk, size_t len, void *arg)
+{
+    struct grep *g = arg;
+    // Binary detection on the first kilobyte streamed.
+    if (g->seen < 1024) {
+        size_t look = len < 1024 - (size_t)g->seen ? len : 1024 - (size_t)g->seen;
+        if (memchr(chunk, 0, look)) {
+            g->binary = 1;
+            return 1;
+        }
+    }
+    g->seen += (long)len;
+    if (!g->patlen)
+        return 0;
+
+    long line0 = g->lines + 1, line = line0;
+    size_t over = g->patlen - 1;
+    const uint8_t *end = chunk + len;
+
+    // Boundary: a pattern spanning the previous chunk's tail and this chunk's
+    // head lands on line0. Skip if line0 was already emitted last chunk.
+    if (g->carrylen && len && g->last_emitted < line0) {
+        uint8_t j[2 * PAT_MAX];
+        size_t h = len < over ? len : over;
+        memcpy(j, g->carry, g->carrylen);
+        memcpy(j + g->carrylen, chunk, h);
+        if (memmem(j, g->carrylen + h, g->pat, g->patlen)) {
+            const uint8_t *le = memchr(chunk, '\n', len);
+            emit_match(g, line0, chunk, (size_t)((le ? le : end) - chunk));
+            g->last_emitted = line0;
+        }
+    }
+
+    // In-chunk scan. last_emitted dedups: any line already reported (here or
+    // by the carry above, or as a chunk-N trailing line) is skipped.
+    const uint8_t *p = chunk;
+    for (;;) {
+        const uint8_t *m = memmem(p, (size_t)(end - p), g->pat, g->patlen);
+        if (!m)
+            break;
+        line += count_nl(p, (size_t)(m - p));
+        const uint8_t *le = memchr(m, '\n', (size_t)(end - m));
+        if (line > g->last_emitted) {
+            const uint8_t *ls = m;
+            while (ls > chunk && ls[-1] != '\n')
+                ls--;
+            emit_match(g, line, ls, (size_t)((le ? le : end) - ls));
+            g->last_emitted = line;
+        }
+        if (!le) {
+            p = end;
+            break;
+        }
+        line++;
+        p = le + 1;
+    }
+    g->lines = line - 1 + count_nl(p, (size_t)(end - p));
+    g->carrylen = len < over ? len : over;
+    memcpy(g->carry, chunk + len - g->carrylen, g->carrylen);
+    return 0;
+}
+
+// Phase 2 worker: stream one file, scan each block, format matches into result.
 static void grep_file(rawfs *fs, file_job *job, const char *pat, size_t patlen)
 {
-    uint8_t *buf;
-    long n = fs->read_file(fs, job->id, &buf);
-    if (n <= 0)
-        return;
-
-    const uint8_t *end = buf + n;
-    if (memchr(buf, 0, n < 1024 ? (size_t)n : 1024)) { // binary
-        free(buf);
-        return;
+    struct grep g = {.path = job->path, .pat = (const uint8_t *)pat, .patlen = patlen};
+    fs->read_file(fs, job->id, grep_sink, &g);
+    if (g.binary && g.out) { // binary detected after some output: discard it
+        free(g.out);
+        g.out = NULL;
     }
-
-    char *out = NULL;
-    size_t olen = 0, ocap = 0, line = 1;
-    const uint8_t *counted = buf;
-    for (const uint8_t *p = buf, *q; (q = memmem(p, (size_t)(end - p), pat, patlen));) {
-        for (const uint8_t *c = counted; c < q; c++)
-            if (*c == '\n')
-                line++;
-        counted = q;
-
-        const uint8_t *ls = q, *le = memchr(q, '\n', (size_t)(end - q));
-        while (ls > buf && ls[-1] != '\n')
-            ls--;
-        if (!le)
-            le = end;
-        emit(&out, &olen, &ocap, job->path, line, ls, (size_t)(le - ls));
-        p = le < end ? le + 1 : end;
-    }
-    free(buf);
-    job->result = out;
+    job->result = g.out;
 }
 
 int ffs_run(rawfs *fs, const char *rel, const char *pattern)
@@ -164,7 +221,10 @@ int ffs_run(rawfs *fs, const char *rel, const char *pattern)
         struct look l = {t, strlen(t), 0, 0};
         fs->list_dir(fs, cur, look_cb, &l);
         if (!l.found) {
-            fprintf(stderr, "ffs: cannot resolve '%s' on device\n", rel);
+            fprintf(stderr,
+                    "ffs: cannot resolve '%s': component '%s' not found under inode %llu "
+                    "(a nested subvolume/mount is not followed)\n",
+                    rel, t, (unsigned long long)cur);
             return -1;
         }
         cur = l.id;
@@ -176,13 +236,13 @@ int ffs_run(rawfs *fs, const char *rel, const char *pattern)
     char path[PATH_CAP] = "";
     collect(fs, cur, path, 0, &fv);
 
-    ffs_log("collected %ld file(s)\n", fv.n);
-    if (ffs_verbose)
-        for (long i = 0; i < fv.n && i < 40; i++)
-            fprintf(stderr, "    %s\n", fv.v[i].path);
-
+    ffs_log("collected %ld file(s)\n\n", fv.n);
     // 2. grep files (parallel, per-file output buffers — no shared writes)
     size_t patlen = strlen(pattern);
+    if (patlen > PAT_MAX) {
+        fprintf(stderr, "ffs: pattern too long (%zu > %d)\n", patlen, PAT_MAX);
+        return -1;
+    }
 #pragma omp parallel for schedule(dynamic, 16)
     for (long i = 0; i < fv.n; i++)
         grep_file(fs, &fv.v[i], pattern, patlen);
