@@ -102,6 +102,9 @@ static uint64_t map(bfs *b, uint64_t logical)
     return 0;
 }
 
+// Returns 0 on success, -1 on I/O / unmapped / stale (block self-bytenr at
+// hdr+48 must equal the requested logical address; mismatch means btrfs reused
+// this block under us — a hazard when reading a live rw filesystem).
 static int read_block(bfs *b, uint64_t logical, uint8_t *blk)
 {
     // Cache hit: serve from the per-thread node cache, move to front.
@@ -124,6 +127,12 @@ static int read_block(bfs *b, uint64_t logical, uint8_t *blk)
     if (!phys)
         return -1;
     if (pread(b->fd, blk, b->nodesize, (off_t)phys) != (ssize_t)b->nodesize)
+        return -1;
+    // Tree-block self-bytenr at hdr+48 must equal the requested logical addr.
+    // A mismatch means btrfs freed this block and reused it for something else
+    // (live-rw race) — treat as a read failure so the caller surfaces the bad
+    // result instead of acting on garbage.
+    if (le64(blk + 48) != logical)
         return -1;
 
     // i is the first free slot (cache not full) or NODE_CACHE (full -> evict).
@@ -293,27 +302,19 @@ static int btr_open(rawfs *fs, const char *device, const char *mntopts)
         fprintf(stderr, "ffs: open %s: %s (need root?)\n", device, strerror(errno));
         return -1;
     }
-
     uint8_t sb[4096];
     if (pread(b->fd, sb, sizeof sb, SUPER_OFFSET) != sizeof sb ||
         le64(sb + 64) != MAGIC) {
         fprintf(stderr, "ffs: %s: no btrfs superblock\n", device);
         return -1;
     }
-    uint64_t root_tree = b->root_tree = le64(sb + 80);
+    b->root_tree = le64(sb + 80);
     uint64_t chunk_root = le64(sb + 88);
     b->nodesize = le32(sb + 148);
     if (b->nodesize < 4096 || b->nodesize > 65536) {
         fprintf(stderr, "ffs: bad nodesize %u\n", b->nodesize);
         return -1;
     }
-    ffs_log("btrfs: nodesize=%u root_tree=%llu chunk_root=%llu label='%.*s'\n",
-            b->nodesize, (unsigned long long)root_tree, (unsigned long long)chunk_root,
-            256, (const char *)sb + 299);
-
-    // bootstrap the logical->physical map from the superblock's system
-    // chunk array (disk_key + btrfs_chunk entries), then read the full
-    // chunk tree with it
     uint32_t sys_size = le32(sb + 160);
     for (uint32_t off = 0; off + 17 + 48 <= sys_size;) {
         const uint8_t *p = sb + SYS_CHUNK_ARRAY + off, *c = p + 17;
@@ -322,10 +323,12 @@ static int btr_open(rawfs *fs, const char *device, const char *mntopts)
         off += 17 + 48 + 32u * le16(c + 44);
     }
     if (walk(b, chunk_root, FIRST_CHUNK_TREE, CHUNK_ITEM_KEY, chunk_cb, b)) {
-        fprintf(stderr, "ffs: cannot read chunk tree\n");
+        fprintf(stderr, "ffs: %s: cannot read chunk tree (filesystem may have raced; "
+                        "snapshot first for live rw filesystems)\n", device);
         return -1;
     }
-    ffs_log("btrfs: chunk map has %d entries\n", b->nchunks);
+    ffs_log("btrfs: nodesize=%u root_tree=%llu chunk map has %d entries\n", b->nodesize,
+            (unsigned long long)b->root_tree, b->nchunks);
 
     uint64_t subvolid = 5; // default FS_TREE
     const char *s = strstr(mntopts, "subvolid=");
@@ -339,7 +342,7 @@ static int btr_open(rawfs *fs, const char *device, const char *mntopts)
         return -1;
     }
     uint8_t ri[184];
-    find_one(b, root_tree, subvolid, ROOT_ITEM_KEY, ri, sizeof ri);
+    find_one(b, b->root_tree, subvolid, ROOT_ITEM_KEY, ri, sizeof ri);
     fs->root = pack_ino(idx, le64(ri + 168));
     ffs_log("btrfs: subvolume root dir inode=%llu fs-tree=%llu\n",
             (unsigned long long)(fs->root & INO_MASK),
@@ -499,15 +502,15 @@ static long btr_read_file(rawfs *fs, ino_id id, fs_sink sink, void *arg)
     uint64_t ino = id & INO_MASK;
     uint8_t ii[160];
     if (find_one(b, fs_root, ino, INODE_ITEM_KEY, ii, sizeof ii) < 24)
-        return -1;
-    uint64_t size = le64(ii + 16); // btrfs_inode_item.size
+        return -1; // includes -2 (stale mid-parallel) — silent skip for this file
+    uint64_t size = le64(ii + 16);
     if (!size || size > FILE_CAP)
         return -1;
 
     struct rf r = {.b = b, .sink = sink, .arg = arg, .size = size};
     if (walk(b, fs_root, ino, EXTENT_DATA_KEY, ext_cb, &r) < 0 || r.err)
         return -1;
-    if (!r.rc && r.next < size) // trailing hole
+    if (!r.rc && r.next < size)
         sink_zeros(sink, arg, size - r.next);
     return (long)size;
 }

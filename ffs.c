@@ -2,6 +2,12 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static inline int omp_get_thread_num(void) { return 0; }
+static inline int omp_get_max_threads(void) { return 1; }
+#endif
 
 #define PATH_CAP 4096
 
@@ -18,27 +24,6 @@ void ffs_log(const char *fmt, ...)
     fputs("ffs: ", stderr);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
-}
-
-typedef struct {
-    ino_id id;
-    char *name;
-    uint8_t is_dir;
-} ent;
-typedef struct {
-    ent *v;
-    int n, cap;
-} entvec;
-
-static int collect_cb(const rg_dirent *d, void *arg)
-{
-    entvec *ev = arg;
-    if (ev->n == ev->cap) {
-        ev->cap = ev->cap ? ev->cap * 2 : 16;
-        ev->v = realloc(ev->v, (size_t)ev->cap * sizeof *ev->v);
-    }
-    ev->v[ev->n++] = (ent){d->id, strndup(d->name, d->name_len), d->is_dir};
-    return 0;
 }
 
 struct look {
@@ -59,44 +44,61 @@ static int look_cb(const rg_dirent *d, void *arg)
     return 0;
 }
 
-// One regular file to grep; result holds its formatted matches (or NULL).
 typedef struct {
     ino_id id;
     char *path;
-    char *result;
 } file_job;
 typedef struct {
     file_job *v;
     long n, cap;
 } filevec;
 
-static void push_file(filevec *fv, ino_id id, const char *path)
-{
-    if (fv->n == fv->cap) {
-        fv->cap = fv->cap ? fv->cap * 2 : 1024;
-        fv->v = realloc(fv->v, (size_t)fv->cap * sizeof *fv->v);
-    }
-    fv->v[fv->n++] = (file_job){id, strdup(path), NULL};
-}
+// One growable output buffer per thread. Matches are appended directly here
+// (no per-file buffer; no malloc per match).
+typedef struct {
+    char *buf;
+    size_t len, cap;
+} outbuf;
 
-// Phase 1: walk directories serially, recording every regular file's path.
-static void collect(rawfs *fs, ino_id dir, char *path, size_t plen, filevec *fv)
-{
-    entvec ev = {0};
-    fs->list_dir(fs, dir, collect_cb, &ev);
+// Recursive directory walker. Lives in the callback so dirent names are used
+// in place (no per-entry strndup); the path buffer is shared and rewound on
+// return, so collect() does one strdup per kept file and zero per directory.
+struct collect_ctx {
+    rawfs *fs;
+    char *path;
+    size_t plen;
+    filevec *fv;
+};
 
-    for (int i = 0; i < ev.n; i++) {
-        ent *e = &ev.v[i];
-        int n = snprintf(path + plen, PATH_CAP - plen, "%s%s", plen ? "/" : "", e->name);
-        if (n > 0 && plen + (size_t)n < PATH_CAP) {
-            if (e->is_dir)
-                collect(fs, e->id, path, plen + (size_t)n, fv);
-            else
-                push_file(fv, e->id, path);
+static int collect_cb(const rg_dirent *d, void *arg)
+{
+    struct collect_ctx *c = arg;
+    // skip "." and ".."
+    if (d->name_len <= 2 && d->name[0] == '.' &&
+        (d->name_len == 1 || d->name[1] == '.'))
+        return 0;
+    size_t need = c->plen + (c->plen ? 1 : 0) + d->name_len;
+    if (need + 1 >= PATH_CAP)
+        return 0;
+    if (c->plen)
+        c->path[c->plen] = '/';
+    memcpy(c->path + c->plen + (c->plen ? 1 : 0), d->name, d->name_len);
+    c->path[need] = 0;
+    size_t saved = c->plen;
+    c->plen = need;
+    if (d->is_dir) {
+        c->fs->list_dir(c->fs, d->id, collect_cb, c);
+    } else {
+        filevec *fv = c->fv;
+        if (fv->n == fv->cap) {
+            fv->cap = fv->cap ? fv->cap * 2 : 1024;
+            fv->v = realloc(fv->v, (size_t)fv->cap * sizeof *fv->v);
         }
-        free(e->name);
+        fv->v[fv->n++] = (file_job){d->id, strdup(c->path)};
     }
-    free(ev.v);
+    c->plen = saved;
+    c->path[saved] = 0;
+    return 0;
 }
 
 enum { PAT_MAX = 256 }; // pattern-length cap (carry is patlen-1, joined 2*PAT_MAX)
@@ -104,8 +106,8 @@ struct grep {
     const char *path;
     const uint8_t *pat;
     size_t patlen;
-    char *out; // formatted matches, or NULL
-    size_t olen, ocap;
+    outbuf *out;            // thread-local output (shared across files on this thread)
+    size_t out_start;       // outbuf->len at file start (rewind on binary)
     uint8_t carry[PAT_MAX]; // last patlen-1 bytes of the previous chunk
     size_t carrylen;
     long lines;        // newlines fully seen so far (line of next byte = lines+1)
@@ -125,13 +127,14 @@ static inline long count_nl(const uint8_t *p, size_t n)
 
 static void emit_match(struct grep *g, long line, const uint8_t *ls, size_t llen)
 {
+    outbuf *o = g->out;
     size_t need = strlen(g->path) + llen + 32;
-    if (g->olen + need > g->ocap) {
-        g->ocap = (g->olen + need) * 2;
-        g->out = realloc(g->out, g->ocap);
+    if (o->len + need > o->cap) {
+        o->cap = (o->len + need) * 2;
+        o->buf = realloc(o->buf, o->cap);
     }
-    g->olen += (size_t)snprintf(g->out + g->olen, g->ocap - g->olen, "%s:%ld:%.*s\n",
-                                g->path, line, (int)llen, ls);
+    o->len += (size_t)snprintf(o->buf + o->len, o->cap - o->len, "%s:%ld:%.*s\n",
+                               g->path, line, (int)llen, ls);
 }
 
 static int grep_sink(const uint8_t *chunk, size_t len, void *arg)
@@ -196,16 +199,17 @@ static int grep_sink(const uint8_t *chunk, size_t len, void *arg)
     return 0;
 }
 
-// Phase 2 worker: stream one file, scan each block, format matches into result.
-static void grep_file(rawfs *fs, file_job *job, const char *pat, size_t patlen)
+// Phase 2 worker: stream one file, scan each block, append matches to ob.
+// Returns 1 if the underlying read failed (file skipped — typically a live-fs
+// race on btrfs where the dirent's inode no longer exists), 0 otherwise.
+static int grep_file(rawfs *fs, file_job *job, const char *pat, size_t patlen, outbuf *ob)
 {
-    struct grep g = {.path = job->path, .pat = (const uint8_t *)pat, .patlen = patlen};
-    fs->read_file(fs, job->id, grep_sink, &g);
-    if (g.binary && g.out) { // binary detected after some output: discard it
-        free(g.out);
-        g.out = NULL;
-    }
-    job->result = g.out;
+    struct grep g = {.path = job->path, .pat = (const uint8_t *)pat, .patlen = patlen,
+                     .out = ob, .out_start = ob->len};
+    long n = fs->read_file(fs, job->id, grep_sink, &g);
+    if (g.binary) // binary detected after some output: rewind
+        ob->len = g.out_start;
+    return n < 0 ? 1 : 0;
 }
 
 int ffs_run(rawfs *fs, const char *rel, const char *pattern)
@@ -234,27 +238,35 @@ int ffs_run(rawfs *fs, const char *rel, const char *pattern)
     // 1. collect file list (serial)
     filevec fv = {0};
     char path[PATH_CAP] = "";
-    collect(fs, cur, path, 0, &fv);
+    struct collect_ctx cc = {fs, path, 0, &fv};
+    fs->list_dir(fs, cur, collect_cb, &cc);
 
     ffs_log("collected %ld file(s)\n\n", fv.n);
-    // 2. grep files (parallel, per-file output buffers — no shared writes)
+    // 2. grep files (parallel; each thread appends to its own outbuf — no
+    // shared writes, no per-file alloc churn).
     size_t patlen = strlen(pattern);
     if (patlen > PAT_MAX) {
         fprintf(stderr, "ffs: pattern too long (%zu > %d)\n", patlen, PAT_MAX);
         return -1;
     }
-#pragma omp parallel for schedule(dynamic, 16)
+    int nthreads = omp_get_max_threads();
+    outbuf *obs = calloc((size_t)nthreads, sizeof *obs);
+    long skipped = 0;
+#pragma omp parallel for schedule(dynamic, 16) reduction(+:skipped)
     for (long i = 0; i < fv.n; i++)
-        grep_file(fs, &fv.v[i], pattern, patlen);
+        skipped += grep_file(fs, &fv.v[i], pattern, patlen, &obs[omp_get_thread_num()]);
 
-    // 3. print in collection order (serial, deterministic)
-    for (long i = 0; i < fv.n; i++) {
-        if (fv.v[i].result) {
-            fputs(fv.v[i].result, stdout);
-            free(fv.v[i].result);
-        }
-        free(fv.v[i].path);
+    // 3. dump per-thread buffers (order: thread 0..N; within each thread,
+    // collect order). Cross-thread file order isn't guaranteed.
+    for (int t = 0; t < nthreads; t++) {
+        if (obs[t].len)
+            fwrite(obs[t].buf, 1, obs[t].len, stdout);
+        free(obs[t].buf);
     }
+    free(obs);
+    for (long i = 0; i < fv.n; i++)
+        free(fv.v[i].path);
     free(fv.v);
+
     return 0;
 }
