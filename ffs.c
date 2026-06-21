@@ -13,8 +13,6 @@ static inline int omp_get_max_threads(void) { return 1; }
 
 int ffs_verbose = 0;
 
-// Emit a diagnostic line to stderr, prefixed with "ffs: ", only when verbose
-// mode is enabled (-v/--verbose).
 void ffs_log(const char *fmt, ...)
 {
     if (!ffs_verbose)
@@ -232,15 +230,14 @@ int ffs_run(rawfs *fs, const char *rel, const char *pattern)
     }
     ffs_log("start inode=%llu, searching for \"%s\"\n", (unsigned long long)cur, pattern);
 
-    // 1. collect file list (serial)
+    // 1. collect file list
     filevec fv = {0};
     char path[PATH_CAP] = "";
     struct collect_ctx cc = {fs, path, 0, &fv};
     fs->list_dir(fs, cur, collect_cb, &cc);
 
     ffs_log("collected %ld file(s)\n\n", fv.n);
-
-    // 2. grep files (parallel)
+    // 2. grep files via openmp
     size_t patlen = strlen(pattern);
     if (patlen > PAT_MAX) {
         fprintf(stderr, "ffs: pattern too long (%zu > %d)\n", patlen, PAT_MAX);
