@@ -34,8 +34,8 @@ enum {
     ROOT_DIR_INO = 2,
     FS_UNENCRYPTED = 0x01,
     INCOMPAT_CASE_INSENSITIVE = 0x1, // apfs_incompatible_features: hashed drec keys
-    INCOMPAT_NORMALIZATION_INSENSITIVE = 0x100,
-    INCOMPAT_SEALED_VOLUME = 0x800,
+    INCOMPAT_NORMALIZATION_INSENSITIVE = 0x8,
+    INCOMPAT_SEALED_VOLUME = 0x20,
     FILE_CAP = 64 << 20,
 };
 
@@ -303,7 +303,7 @@ static int apfs_open(rawfs *fs, const char *device, const char *mntopts)
     // Dir-record key layout depends on the volume's incompatible-features:
     // case- or normalization-insensitive volumes hash the name into the key
     // (name at k+12), otherwise the key is plain (name at k+10).
-    uint64_t incompat = le64(apsb + 88);
+    uint64_t incompat = le64(apsb + 56); // apfs_superblock_t.apfs_incompatible_features
     a->hashed_drecs =
         (incompat & (INCOMPAT_CASE_INSENSITIVE | INCOMPAT_NORMALIZATION_INSENSITIVE)) !=
         0;
