@@ -1,22 +1,23 @@
 # FFS - F* File System
 
-This is a cli tool for searching files (like grep) that is not using OS kernel to read files, but reads your discs directly. It is practically useless, *but insanely cool*.
+This is a cli tool for searching files (like grep) that does not use the OS kernel to read files, but reads your disks directly. It is practically useless, *but insanely cool*.
 
-this is just 1.5k lines of C code that:
+this is just ~1.5k lines of C code that:
 
-- requires sudo to run the grep search
-- requies disabling SIP protection to run on the main macos
+- requires sudo only when reading a raw device node (e.g. `/dev/rdisk*`); searching an image file needs no elevated permissions
+- requires disabling SIP protection to run on the main macOS disk
 - can miss some recent file writes (will require a manual `sync` call)
-- might not be able to search trees in a highly volatile file systems like fs while any other system components is writing any file in the OS
+- might not be able to search trees on a highly volatile file system while other system components are writing files in the OS
+- works only for file systems implemented manually in this project
 
 but at the same time
 
-- directly reads blocks from your discs
-- doesn't use read syscalls at all on the blocks
-- has gemetrical progression in performance over ripgrep (the more files you have the faster it is)
+- directly reads blocks from your disks
+- bypasses the VFS / buffered `read()` path, instead it `pread`s the block device directly
+- progressively faster than ripgrep (the more files you need to search - the faster it is than ripgrep) 
 - can search unmounted volumes - it just parses binary blobs
-- detect and skip binary files
-- spread the load across all the cores via openmp
+- detects and skips binary files
+- spreads the load across all the cores via openmp
 
 ## Supported file systems
 
@@ -26,7 +27,7 @@ on linux mostly any file system is easy to implement
 
 [./fs/ext4.c](./fs/ext4.c)
 
-This is the easiest file systems to support copy-on-write and does direct writes to the blocks, so most of the time this is the best file system for ffs. Sometimes you might see that ffs can not see some recent updates to the files, this might happen if kernel is storing the recent updates in the cache and deferring updates. You can enforce synchronization using
+This is the easiest file system to support: it is a journaling file system that writes in place (no copy-on-write), so most of the time this is the best file system for ffs. Sometimes you might see that ffs can not see some recent updates to the files, this might happen if the kernel is holding recent updates in the cache and deferring writes to disk. You can enforce synchronization using
 
 ```
 sync
@@ -36,9 +37,9 @@ sync
 
 [./fs/btrfs.c](./fs/btrfs.c)
 
-B-tree file system is signficantly more complicated and more efficient file storage and comes with additional limitation:
+B-tree file system is significantly more complicated, is a more efficient file storage and comes with an additional limitation:
 
-When any file on your file system is updated the whole superblock requires and update as well, which means that if ffs read the superblock (the high level b-tree) and after that kernel is updated the tree - the whole read becomes invalid.
+When any file on your file system is updated the whole superblock requires an update as well, which means that if ffs reads the superblock (the high level b-tree) and after that the kernel updates the tree - the whole read becomes invalid.
 
 This is possible to bypass using [fsfreeze](https://man7.org/linux/man-pages/man8/fsfreeze.8.html) or by creating a separate detached volume
 
@@ -46,42 +47,51 @@ This is possible to bypass using [fsfreeze](https://man7.org/linux/man-pages/man
 
 [./fs/apfs.c](./fs/apfs.c)
 
-APFS is propriatery file system impelmented by Apple that was reverse-engineered and also supported but Apple has singifcantly increased security policies. 
+APFS is a proprietary file system implemented by Apple that has been reverse-engineered and is also supported here, but Apple has significantly increased its security policies.
 
-**You won't be able to run ffs on your main disc without disabling SIP**
+**You won't be able to run ffs on your main disk without disabling SIP**
 
-SIP - system integrity protection is a special security feature that prohibits any access to the main disc superblock even as a root user. You can not bypass it even with sudo, you can disable this feature or you already do if you use some projects like yabai.
+SIP - system integrity protection is a special security feature that prohibits any access to the main disk superblock even as a root user. You can not bypass it even with sudo; you have to disable this feature (you may already have it disabled if you use projects like yabai).
 
-Though there is a way to test ffs on apple file system - you can search raw `.dmg` files without any elevated permissions (yes the app installers are just detached volumes). With ffs you don't need to mount anything, you can just give it a path to the raw bytes of a volume
+There is a way to test ffs on the Apple file system without touching your main disk - you can search raw `.dmg` files without any elevated permissions (yes, the app installers are just detached volumes). With ffs you don't need to mount anything, you can just give it a path to the raw bytes of a volume along with the file system type:
 
 ```bash
-ffs "<QUERY>" /path/to/volume.dmg
+ffs "<QUERY>" /path/to/volume.dmg apfs
 ```
 
 ## Searching in detached volumes
 
-Becuase ffs is reading bytes directly you can use it search any detached volumes without mounting them to the file system. E.g. reading `.iso` or `.dmg` files.
+Because ffs reads bytes directly you can use it to search any detached volumes without mounting them to the file system. E.g. reading `.iso` or `.dmg` files.
 
 ## Speed
 
-This is the funniest part - ffs doesn't have an access to VFS / kernel file system cache. That's why it is going to be slower on the smaller files, but progressively more efficient when the cache is exhausted and your OS needs to go and read the actual disc state.
+This is the funniest part - ffs doesn't have access to the VFS / kernel file system cache. That's why it is going to be slower on smaller (or already cached) directories, but progressively faster once the cache is exhausted and your kernel has to go and read the actual disk state.
 
-Why? Becuase ffs doesn't really do much - doesn't do all the preflights checks like permissions and it reads and parallelizes raw blocks of files which are mostly always same in size.
+Why? Exactly to prove the point that at some point the kernel VFS becomes an overhead.
 
-This is the search result comparing ffs to ripgrep on btrfs mounted drive. Make sure that ripgrep is using way more advanced SIMD based matching and file walker, ffs is just 1.5k lines of C code.
+This is the search result comparing `ffs` to `ripgrep` on a btrfs mounted drive. Note that ripgrep uses a far more advanced SIMD-based matcher and file walker, while ffs is just ~1.8k lines of C code.
 
 ```
 [repos — 631k files]
-  ffs  cold |####                                              | 5.505s
-  rg   cold |###                                               | 4.813s
+  ffs |####                                              | 5.505s
+  rg  |###                                               | 4.813s
 
 [dev — 1.50M files]
-  ffs  cold |############                                      | 18.413s
-  rg   cold |#################                                 | 25.673s
+  ffs |############                                      | 18.413s
+  rg  |#################                                 | 25.673s
 
 [home — 3.25M files]
-  ffs  cold |########################                          | 36.205s
-  rg   cold |##################################################| 74.690s
+  ffs |########################                          | 36.205s
+  rg  |##################################################| 74.690s
 ```
 
 The flags used for ripgrep are `-F --no-heading -H -n --no-ignore --hidden --one-file-system --no-messages` - which brings it to emit the same results as ffs.
+
+## Build the project
+
+All you need to compile a project is `libzstd` for btrfs, `openmp` in your pkg-config then simply
+
+```bash
+make ffs
+ffs --help
+```
