@@ -199,9 +199,6 @@ static int grep_sink(const uint8_t *chunk, size_t len, void *arg)
     return 0;
 }
 
-// Phase 2 worker: stream one file, scan each block, append matches to ob.
-// Returns 1 if the underlying read failed (file skipped — typically a live-fs
-// race on btrfs where the dirent's inode no longer exists), 0 otherwise.
 static int grep_file(rawfs *fs, file_job *job, const char *pat, size_t patlen, outbuf *ob)
 {
     struct grep g = {.path = job->path, .pat = (const uint8_t *)pat, .patlen = patlen,
@@ -242,8 +239,8 @@ int ffs_run(rawfs *fs, const char *rel, const char *pattern)
     fs->list_dir(fs, cur, collect_cb, &cc);
 
     ffs_log("collected %ld file(s)\n\n", fv.n);
-    // 2. grep files (parallel; each thread appends to its own outbuf — no
-    // shared writes, no per-file alloc churn).
+
+    // 2. grep files (parallel)
     size_t patlen = strlen(pattern);
     if (patlen > PAT_MAX) {
         fprintf(stderr, "ffs: pattern too long (%zu > %d)\n", patlen, PAT_MAX);

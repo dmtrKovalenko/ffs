@@ -1,6 +1,3 @@
-// fs/btrfs.c — btrfs on-disk reader: superblock -> chunk map -> b-tree walks.
-// Field offsets follow linux/include/uapi/linux/btrfs_tree.h.
-// Single device (stripe 0 only), checksums not verified, read-only.
 #define _GNU_SOURCE
 #include "../ffs.h"
 #include <errno.h>
@@ -25,6 +22,9 @@ size_t ZSTD_initDStream(ZSTD_DStream_s *);
 size_t ZSTD_decompressStream(ZSTD_DStream_s *, ZSTD_outBuffer *, ZSTD_inBuffer *);
 unsigned ZSTD_isError(size_t);
 
+// btrfs: superblock -> chunk map -> b-tree walks.
+// Field offsets follow linux/include/uapi/linux/btrfs_tree.h.
+// Single device (stripe 0 only), checksums not verified, read-only.
 enum {
     SUPER_OFFSET = 0x10000,
     SYS_CHUNK_ARRAY = 811, // offset of sys_chunk_array in superblock
@@ -51,14 +51,10 @@ typedef struct {
     uint64_t logical, length, phys;
 } chunk;
 
-// A subvolume we've descended into: its id and the logical address of its
-// fs-tree root. ino_id values pack the index into this table (high 16 bits)
-// alongside the inode number (low 48 bits), so a single id identifies both
-// which subvolume an inode lives in and the inode itself.
 typedef struct {
     uint64_t subvolid;
     uint64_t fs_root;
-} subvol;
+} subvolume;
 
 enum { INO_BITS = 48 };
 #define INO_MASK ((1ULL << INO_BITS) - 1)
@@ -67,7 +63,7 @@ typedef struct {
     int fd;
     uint32_t nodesize;
     uint64_t root_tree; // logical addr of the root tree (subvol -> fs-tree)
-    subvol *subvols;    // interned during the serial resolve/collect phase
+    subvolume *subvols; // interned during the serial resolve/collect phase
     int nsubvols, scap;
     chunk *chunks;
     int nchunks, ncap;
@@ -102,9 +98,6 @@ static uint64_t map(bfs *b, uint64_t logical)
     return 0;
 }
 
-// Returns 0 on success, -1 on I/O / unmapped / stale (block self-bytenr at
-// hdr+48 must equal the requested logical address; mismatch means btrfs reused
-// this block under us — a hazard when reading a live rw filesystem).
 static int read_block(bfs *b, uint64_t logical, uint8_t *blk)
 {
     // Cache hit: serve from the per-thread node cache, move to front.
@@ -121,8 +114,6 @@ static int read_block(bfs *b, uint64_t logical, uint8_t *blk)
         }
     }
 
-    // Miss: read into the caller's buffer first (so an I/O error never leaves
-    // a corrupt entry behind), then populate the cache from it on success.
     uint64_t phys = map(b, logical);
     if (!phys)
         return -1;
@@ -130,8 +121,6 @@ static int read_block(bfs *b, uint64_t logical, uint8_t *blk)
         return -1;
     // Tree-block self-bytenr at hdr+48 must equal the requested logical addr.
     // A mismatch means btrfs freed this block and reused it for something else
-    // (live-rw race) — treat as a read failure so the caller surfaces the bad
-    // result instead of acting on garbage.
     if (le64(blk + 48) != logical)
         return -1;
 
@@ -243,7 +232,7 @@ static int resolve_subvolume(bfs *b, uint64_t subvolid)
         b->scap = b->scap ? b->scap * 2 : 8;
         b->subvols = realloc(b->subvols, (size_t)b->scap * sizeof *b->subvols);
     }
-    b->subvols[b->nsubvols] = (subvol){subvolid, le64(ri + 176)};
+    b->subvols[b->nsubvols] = (subvolume){subvolid, le64(ri + 176)};
     return b->nsubvols++;
 }
 
@@ -323,8 +312,10 @@ static int btr_open(rawfs *fs, const char *device, const char *mntopts)
         off += 17 + 48 + 32u * le16(c + 44);
     }
     if (walk(b, chunk_root, FIRST_CHUNK_TREE, CHUNK_ITEM_KEY, chunk_cb, b)) {
-        fprintf(stderr, "ffs: %s: cannot read chunk tree (filesystem may have raced; "
-                        "snapshot first for live rw filesystems)\n", device);
+        fprintf(stderr,
+                "ffs: %s: cannot read chunk tree (filesystem may have raced; "
+                "snapshot first for live rw filesystems)\n",
+                device);
         return -1;
     }
     ffs_log("btrfs: nodesize=%u root_tree=%llu chunk map has %d entries\n", b->nodesize,
@@ -375,7 +366,7 @@ static int dir_cb(uint64_t key_off, const uint8_t *d, uint32_t sz, void *arg)
     if (d[8] == ROOT_ITEM_KEY) { // nested subvolume: follow it
         subidx = resolve_subvolume(l->b, inode);
         if (subidx < 0)
-            return 0; // can't resolve the target root: skip
+            return 0;    // can't resolve the target root: skip
         uint8_t ri[184]; // its root_dirid is the subvolume's root directory
         find_one(l->b, l->b->root_tree, inode, ROOT_ITEM_KEY, ri, sizeof ri);
         inode = le64(ri + 168);
@@ -405,7 +396,7 @@ struct rf {
     int err;
 };
 
-static int ext_cb(uint64_t file_off, const uint8_t *e, uint32_t sz, void *arg)
+static int visit_node(uint64_t file_off, const uint8_t *e, uint32_t sz, void *arg)
 {
     struct rf *r = arg;
     bfs *b = r->b;
@@ -420,15 +411,15 @@ static int ext_cb(uint64_t file_off, const uint8_t *e, uint32_t sz, void *arg)
     // btrfs_file_extent_item: gen(8) ram_bytes(8) compression(1) enc(1)
     // other(2) type(1), then inline data or disk_bytenr(8) disk_num_bytes(8)
     // offset(8) num_bytes(8)
-    uint8_t comp = e[16];
-    if (comp != COMP_NONE && comp != COMP_ZSTD) { // zlib/lzo: skip file
+    uint8_t compression = e[16];
+    if (compression != COMP_NONE && compression != COMP_ZSTD) { // zlib/lzo: skip file
         r->err = 1;
         return 1;
     }
 
     if (e[20] == EXT_INLINE) {
         uint32_t n = sz - 21;
-        if (comp == COMP_ZSTD) {
+        if (compression == COMP_ZSTD) {
             if (!grow(&t_dec, &t_dec_cap, cap)) {
                 r->err = 1;
                 return 1;
@@ -462,7 +453,7 @@ static int ext_cb(uint64_t file_off, const uint8_t *e, uint32_t sz, void *arg)
         r->err = 1;
         return 1;
     }
-    if (comp == COMP_NONE) {
+    if (compression == COMP_NONE) {
         int rr = sink_pread(b->fd, phys + eoff, nbytes, r->sink, r->arg);
         if (rr < 0) {
             r->err = 1;
@@ -501,14 +492,16 @@ static long btr_read_file(rawfs *fs, ino_id id, fs_sink sink, void *arg)
     uint64_t fs_root = b->subvols[id >> INO_BITS].fs_root;
     uint64_t ino = id & INO_MASK;
     uint8_t ii[160];
-    if (find_one(b, fs_root, ino, INODE_ITEM_KEY, ii, sizeof ii) < 24)
-        return -1; // includes -2 (stale mid-parallel) — silent skip for this file
+    if (find_one(b, fs_root, ino, INODE_ITEM_KEY, ii, sizeof ii) < 24) {
+        return -1;
+    }
+
     uint64_t size = le64(ii + 16);
     if (!size || size > FILE_CAP)
         return -1;
 
     struct rf r = {.b = b, .sink = sink, .arg = arg, .size = size};
-    if (walk(b, fs_root, ino, EXTENT_DATA_KEY, ext_cb, &r) < 0 || r.err)
+    if (walk(b, fs_root, ino, EXTENT_DATA_KEY, visit_node, &r) < 0 || r.err)
         return -1;
     if (!r.rc && r.next < size)
         sink_zeros(sink, arg, size - r.next);
@@ -524,7 +517,7 @@ static void btr_close(rawfs *fs)
         close(b->fd);
     free(b->chunks);
     free(b->subvols);
-    free(b); // per-thread zstd scratch (t_*) leaks at exit, by design
+    free(b); // per-thread zstd scratch leaks at exit, by design
 }
 
 int btrfs_init(rawfs *fs)

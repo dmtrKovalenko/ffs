@@ -1,6 +1,3 @@
-// fs/ext4.c — ext4 on-disk reader: superblock -> group descriptors -> inodes
-// -> extent trees -> directory blocks. Field offsets follow the kernel's
-// fs/ext4/ext4.h. Extent-mapped files only (ext4 default), read-only.
 #define _GNU_SOURCE
 #include "../ffs.h"
 #include <errno.h>
@@ -10,6 +7,12 @@
 #include <string.h>
 #include <unistd.h>
 
+// ext4: superblock 
+// -> group descriptors 
+// -> inodes
+// -> extent trees 
+// -> directory blocks. 
+// Field offsets follow the kernel's fs/ext4/ext4.h
 enum {
     SB_OFFSET = 1024,
     SB_MAGIC = 0xEF53,
@@ -46,9 +49,7 @@ static int read_inode(efs *e, ino_id ino, uint8_t inode[256])
                : -1;
 }
 
-// Streaming state for extent walks: sink + bookkeeping to reconstruct the file
-// in ascending file-offset order. cap is logical size; next is the first byte
-// not yet streamed (gaps before an extent are holes -> zeros).
+// Streaming state for extent walks: sink + bootstrap version of files
 struct estream {
     efs *e;
     fs_sink sink;
@@ -174,7 +175,7 @@ static int collect_sink(const uint8_t *chunk, size_t len, void *arg)
 }
 
 static int ext4_list_dir(rawfs *fs, ino_id dir, int (*cb)(const rg_dirent *, void *),
-                      void *arg)
+                         void *arg)
 {
     efs *e = fs->ctx;
     struct collect c = {0};

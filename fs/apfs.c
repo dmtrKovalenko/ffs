@@ -1,13 +1,3 @@
-// fs/apfs.c — APFS on-disk reader (PROTOTYPE).
-//
-// Path: container superblock (NXSB, block 0)
-// -> container object map (physical B-tree)
-// -> volume superblock (APSB)
-// -> volume object map
-// -> root fs-tree (a virtual B-tree; child pointers resolved through the volume
-// omap)
-// -> inode / dir-record / file-extent records
-// -> 16kb blocks
 #define _GNU_SOURCE
 #include "../ffs.h"
 #include <errno.h>
@@ -17,6 +7,13 @@
 #include <string.h>
 #include <unistd.h>
 
+// Path: container superblock (NXSB, block 0)
+// -> container object map (physical B-tree)
+// -> volume superblock (APSB)
+// -> volume object map
+// -> root fs-tree (a virtual B-tree; child pointers resolved through the volume omap)
+// -> inode / dir-record / file-extent records
+// -> 16kb blocks
 enum {
     NX_MAGIC = 0x4253584E,   // 'NXSB'
     APFS_MAGIC = 0x42535041, // 'APSB'
@@ -379,7 +376,7 @@ static int drec_cb(const uint8_t *k, uint32_t kl, const uint8_t *v, uint32_t vl,
 }
 
 static int apfs_list_dir(rawfs *fs, ino_id dir, int (*cb)(const rg_dirent *, void *),
-                      void *arg)
+                         void *arg)
 {
     afs *a = fs->ctx;
     struct ld l = {cb, arg, a->hashed_drecs};
