@@ -19,6 +19,7 @@ but at the same time
 - detects and skips binary files
 - spreads the load across all the cores via openmp
 
+For the actually working fast file search checkout my project [fff](https://github.com/dmtrKovalenko/fff) - it is significantly outperforms ripgrep without needing a sudo.
 ## Supported file systems
 
 on linux mostly any file system is easy to implement
